@@ -18,8 +18,8 @@ from contextlib import asynccontextmanager
 # Configuración inicial de FastAPI y CORS
 # -----------------------
 
-# Intervalos de actualización para cada endpoint de WebSocket
-UPDATE_INTERVAL = {
+# Intervalos de actualización para cada endpoint de WebSocket (ahora mutable)
+update_interval = {
     "cpu": 3,
     "memory": 5,
     "network": 2,
@@ -27,30 +27,15 @@ UPDATE_INTERVAL = {
     "disk": 5
 }
 
-app = FastAPI(lifespan=lambda app: lifespan(app))
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # -----------------------
 # Configuración de MongoDB para usuarios y métricas
 # -----------------------
 
-
 MONGO_URI = "mongodb+srv://team:SIANSHYO@cluster0.ccwlf.mongodb.net/contactos_db?retryWrites=true&w=majority"
 client = AsyncIOMotorClient(MONGO_URI)
-
 db = client.monitoring_db
 db2 = client.usuarios_db
-
-# Colección para usuarios
 users_collection = db2.users
-
-# Colecciones para almacenar métricas
 metrics_collections = {
     "cpu": db.cpu_metrics,
     "memory": db.memory_metrics,
@@ -59,13 +44,11 @@ metrics_collections = {
     "disk": db.disk_metrics
 }
 
-# Cola para almacenar temporalmente las métricas (por endpoint)
 metrics_queue = defaultdict(list)
 
 # -----------------------
 # Funciones auxiliares para seguridad y manejo de contraseñas
 # -----------------------
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def hash_password(password: str) -> str:
@@ -77,7 +60,6 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 # -----------------------
 # Tarea en segundo plano para guardar métricas en MongoDB
 # -----------------------
-
 async def save_metrics_task():
     """Guarda las métricas acumuladas cada 10 segundos en sus respectivas colecciones."""
     while True:
@@ -95,16 +77,23 @@ async def save_metrics_task():
 # -----------------------
 # Manejo del ciclo de vida de la aplicación con lifespan
 # -----------------------
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(save_metrics_task())
     yield
 
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # -----------------------
 # Función auxiliar para obtener la temperatura de la CPU (en sistemas Linux)
 # -----------------------
-
 async def get_cpu_temperature():
     try:
         temps = []
@@ -123,21 +112,16 @@ async def get_cpu_temperature():
 # -----------------------
 # Manejador genérico para WebSockets que envía métricas y las acumula para MongoDB
 # -----------------------
-
 async def websocket_handler(websocket: WebSocket, endpoint: str, data_func):
     await websocket.accept()
     try:
         while websocket.client_state == WebSocketState.CONNECTED:
             data = await data_func()
-            # Serialización: si el dato es datetime se convierte a ISO
             await websocket.send_text(json.dumps(data, default=lambda o: o.isoformat() if isinstance(o, datetime) else None))
-            
-            # Agregar datos a la cola para MongoDB (se elimina el timestamp para guardar solo las métricas)
             metrics_data = data.copy()
             metrics_data.pop("timestamp", None)
             metrics_queue[endpoint].append(metrics_data)
-            
-            await asyncio.sleep(UPDATE_INTERVAL[endpoint])
+            await asyncio.sleep(update_interval[endpoint])  # Usar intervalo dinámico
     except (ConnectionResetError, RuntimeError) as e:
         print(f"Error en el endpoint {endpoint}: {str(e)}")
     finally:
@@ -147,7 +131,6 @@ async def websocket_handler(websocket: WebSocket, endpoint: str, data_func):
 # -----------------------
 # Endpoints WebSocket para métricas
 # -----------------------
-
 @app.websocket("/ws/cpu")
 async def websocket_cpu(websocket: WebSocket):
     async def get_cpu_data():
@@ -218,36 +201,33 @@ async def websocket_network(websocket: WebSocket):
 async def websocket_processes(websocket: WebSocket):
     async def get_processes_data():
         try:
-            # Ejecutar ps aux
             result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
-            lines = result.stdout.strip().split('\n')[1:]  # Saltar la cabecera
+            lines = result.stdout.strip().split('\n')[1:]
             processes = []
             for line in lines:
-                # Dividimos la línea en partes, pero manejamos las columnas exactas
                 parts = line.split()
-                if len(parts) >= 11:  # Aseguramos que haya suficientes campos
+                if len(parts) >= 11:
                     process = {
                         "USER": parts[0],
                         "PID": int(parts[1]),
                         "%CPU": float(parts[2]),
                         "%MEM": float(parts[3]),
-                        "START": parts[8],  # Columna 9 (índice 8) es START
-                        "TIME": parts[9],   # Columna 10 (índice 9) es TIME
-                        "COMMAND": " ".join(parts[10:])  # Todo lo demás es COMMAND
+                        "START": parts[8],
+                        "TIME": parts[9],
+                        "COMMAND": " ".join(parts[10:])
                     }
                     processes.append(process)
-            # Mantener el formato original
             return {
                 "count": len(processes),
                 "processes": sorted(processes, key=lambda x: x['%CPU'], reverse=True)[:50],
-                "timestamp": datetime.now(UTC)  # Usamos datetime.now(UTC) en lugar de utcnow()
+                "timestamp": datetime.now(UTC)
             }
         except Exception as e:
             print(f"Error al obtener procesos: {e}")
             return {
                 "count": 0,
                 "processes": [],
-                "timestamp": datetime.now(UTC)  # Corrección aquí también
+                "timestamp": datetime.now(UTC)
             }
     await websocket_handler(websocket, "processes", get_processes_data)
 
@@ -287,7 +267,6 @@ async def websocket_disk(websocket: WebSocket):
 # -----------------------
 # Endpoints HTTP para registro y login de usuarios
 # -----------------------
-
 class UserRegister(BaseModel):
     username: str
     email: EmailStr
@@ -325,6 +304,30 @@ async def login(user: UserLogin):
     
     return {"status": "success", "user_id": str(existing_user["_id"]), "name": existing_user.get("username", "Usuario")}
 
+# -----------------------
+# Nueva ruta para actualizar los intervalos desde el frontend
+# -----------------------
+class UpdateIntervals(BaseModel):
+    cpu: Optional[int]
+    memory: Optional[int]
+    network: Optional[int]
+    processes: Optional[int]
+    disk: Optional[int]
+
+@app.post("/update-intervals")
+async def set_update_intervals(intervals: UpdateIntervals):
+    global update_interval
+    new_intervals = intervals.dict(exclude_unset=True)
+    for key, value in new_intervals.items():
+        if key in update_interval:
+            update_interval[key] = value
+        else:
+            raise HTTPException(status_code=400, detail=f"Intervalo inválido: {key}")
+    return {"status": "success", "update_interval": update_interval}
+
+# -----------------------
+# Endpoint HTTP para reporte de métricas
+# -----------------------
 @app.post("/report")
 async def get_metrics_report(
     start_time: Optional[str] = Query(None, description="ISO datetime (e.g., 2025-03-03T00:00:00)"),
@@ -332,7 +335,6 @@ async def get_metrics_report(
 ):
     """Genera un reporte general de métricas almacenadas en MongoDB."""
     try:
-        # Filtros de tiempo (opcional)
         query = {}
         if start_time and end_time:
             query["timestamp"] = {
@@ -340,10 +342,8 @@ async def get_metrics_report(
                 "$lte": datetime.fromisoformat(end_time.replace("Z", "+00:00"))
             }
 
-        # Reporte final
         report = {}
         
-        # CPU Metrics
         cpu_docs = await metrics_collections["cpu"].find(query).to_list(None)
         if cpu_docs:
             usages = [doc["usage"] for doc in cpu_docs]
@@ -354,7 +354,6 @@ async def get_metrics_report(
                 "sample_count": len(usages)
             }
 
-        # Memory Metrics
         memory_docs = await metrics_collections["memory"].find(query).to_list(None)
         if memory_docs:
             percents = [doc["percent"] for doc in memory_docs]
@@ -365,7 +364,6 @@ async def get_metrics_report(
                 "sample_count": len(percents)
             }
 
-        # Network Metrics
         network_docs = await metrics_collections["network"].find(query).to_list(None)
         if network_docs:
             speed_sent = [doc["speed_sent"] for doc in network_docs]
@@ -378,7 +376,6 @@ async def get_metrics_report(
                 "sample_count": len(network_docs)
             }
 
-        # Processes Metrics
         processes_docs = await metrics_collections["processes"].find(query).to_list(None)
         if processes_docs:
             total_processes = [doc["count"] for doc in processes_docs]
@@ -390,7 +387,6 @@ async def get_metrics_report(
                 "sample_count": len(processes_docs)
             }
 
-        # Disk Metrics
         disk_docs = await metrics_collections["disk"].find(query).to_list(None)
         if disk_docs:
             disk_usage = [sum(d["percent"] for d in doc["disks"]) / len(doc["disks"]) for doc in disk_docs]
@@ -408,7 +404,6 @@ async def get_metrics_report(
 # -----------------------
 # Ejecución del servidor
 # -----------------------
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
